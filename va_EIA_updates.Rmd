@@ -14,34 +14,99 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-```
-
-## Introduction
-
-This document compares generator fleets between the Energy Information Administration (EIA) and Energy Exemplar (EI) datasets. The comparison is based on geographic coordinates (latitude and longitude) with a configurable tolerance.
-
-## Load Libraries
-
-```{r load-libraries, include=FALSE}
 library(dplyr)
 library(readr)
 library(knitr)
 library(ggplot2)
 ```
 
+## Introduction
+
+This document compares generator fleets between the Energy Information Administration (EIA) and Energy Exemplar (EI) datasets. The comparison is based on geographic coordinates (latitude and longitude) with a configurable tolerance.
+
+
 ## Define Comparison Function
 
-```{r define-function, results='hide'}
+
+
+
+
+```{r}
+library(dplyr)
+library(readr)
+
+
+#' Group generators by geographic location and aggregate their capacities
+#'
+#' @param gens data.frame: Generator dataframe
+#' @param lat_col character: Name of latitude column
+#' @param lon_col character: Name of longitude column
+#' @param capacity_col character: Name of capacity column
+#' @param name_col character: Name of generator name column
+#'
+#' @return data.frame: Grouped generators with aggregated capacity and generator lists
+group_generators_by_location = function(gens, lat_col, lon_col, capacity_col, name_col) {
+  grouped = gens %>%
+    group_by(across(all_of(c(lat_col, lon_col)))) %>%
+    summarise(
+      gen_names = paste(get(name_col), collapse = "; "),
+      n_generators = n(),
+      total_capacity = sum(get(capacity_col), na.rm = TRUE),
+      first_gen_name = first(get(name_col)),
+      .groups = 'drop'
+    )
+  
+  return(grouped)
+}
+
 #' Compare generators between EI and EIA datasets using geographic coordinates
+#' First groups generators by location, then matches locations
 #'
 #' @param ei_gens data.frame: EI generators dataframe (must have Lat, Lon, Rating columns)
 #' @param eia_gens data.frame: EIA generators dataframe (must have lat, lon, nameplate_capacity columns)
 #' @param coord_tolerance numeric: Maximum distance in degrees for matching (default: 0.02 ≈ 2.2km)
 #'
-#' @return list: Contains in_both, in_ei_only, in_eia_only data frames and summary statistics
-compare_generator_fleets = function(ei_gens, eia_gens, coord_tolerance = 0.02) {
+#' @return list: Contains grouped and detailed views of matches, plus summary statistics
+compare_generator_fleets = function(ei_gens, eia_gens, coord_tolerance = 0.2) {
   
-  # Function to find matches based on lat/lon
+  # Step 1: Group generators by location
+  cat("\nGrouping generators by location...\n")
+  
+  # Group EI generators
+  ei_grouped = ei_gens %>%
+    group_by(Lat, Lon) %>%
+    summarise(
+        GenNames         = paste(GenName, collapse = "; "),
+        BusNumbers       = paste(BusNumber, collapse = "; "),
+        BusNames         = paste(BusName, collapse = "; "),
+        n_ei_generators  = n(),
+        Rating           = sum(Rating),
+        Available        = all(Available),
+        Type             = first(Type),
+        .groups          = 'drop'
+    )
+  
+  cat("  EI:", nrow(ei_gens), "generators →", nrow(ei_grouped), "unique locations\n")
+  
+  # Group EIA generators
+  eia_grouped = eia_gens %>%
+    group_by(lat, lon) %>%
+    summarise(
+      plant_names = paste(plant, collapse = "; "),
+      generator_ids = paste(`generator ID`, collapse = "; "),
+      n_eia_generators = n(),
+      nameplate_capacity = sum(nameplate_capacity),
+      technology = first(technology),
+      ba = first(ba),
+      .groups = 'drop'
+    )
+  
+  cat("  EIA:", nrow(eia_gens), "generators →", nrow(eia_grouped), "unique locations\n")
+  
+  # Step 2: Match locations
+  cat("\nMatching locations (tolerance:", coord_tolerance, "°)...\n")
+  
+  # Function to find closest match
   find_closest_match = function(lat, lon, df, tolerance) {
     distances = sqrt((df$lat - lat)^2 + (df$lon - lon)^2)
     min_dist = min(distances)
@@ -54,82 +119,392 @@ compare_generator_fleets = function(ei_gens, eia_gens, coord_tolerance = 0.02) {
     }
   }
   
-  # Create a copy to avoid modifying original
-  ei_gens_copy = ei_gens
-  
-  # Create matching results
-  ei_gens_copy$eia_match_idx = sapply(1:nrow(ei_gens_copy), function(i) {
-    find_closest_match(ei_gens_copy$Lat[i], ei_gens_copy$Lon[i], 
-                      eia_gens, coord_tolerance)
+  # Match EI locations to EIA locations
+  ei_grouped$eia_match_idx = sapply(1:nrow(ei_grouped), function(i) {
+    find_closest_match(ei_grouped$Lat[i], ei_grouped$Lon[i], 
+                      eia_grouped, coord_tolerance)
   })
   
-  # Generators in both datasets
-  in_both = ei_gens_copy %>% filter(!is.na(eia_match_idx))
+  # Step 3: Create matched dataset
+  in_both_grouped = ei_grouped %>% 
+    filter(!is.na(eia_match_idx))
   
-  # Add EIA data to matched generators
-  if (nrow(in_both) > 0) {
-    in_both$eia_lat = eia_gens$lat[in_both$eia_match_idx]
-    in_both$eia_lon = eia_gens$lon[in_both$eia_match_idx]
-    in_both$eia_capacity = eia_gens$nameplate_capacity[in_both$eia_match_idx]
-    in_both$capacity_diff = in_both$Rating - in_both$eia_capacity
+  if (nrow(in_both_grouped) > 0) {
+    # Add EIA data
+    in_both_grouped$eia_lat = eia_grouped$lat[in_both_grouped$eia_match_idx]
+    in_both_grouped$eia_lon = eia_grouped$lon[in_both_grouped$eia_match_idx]
+    in_both_grouped$eia_plant_names = eia_grouped$plant_names[in_both_grouped$eia_match_idx]
+    in_both_grouped$eia_generator_ids = eia_grouped$generator_ids[in_both_grouped$eia_match_idx]
+    in_both_grouped$n_eia_generators = eia_grouped$n_eia_generators[in_both_grouped$eia_match_idx]
+    in_both_grouped$eia_capacity = eia_grouped$nameplate_capacity[in_both_grouped$eia_match_idx]
     
-    # Rename EI lat/lon for clarity
-    in_both = in_both %>%
+    # Calculate differences
+    in_both_grouped$capacity_diff = in_both_grouped$Rating - in_both_grouped$eia_capacity
+    in_both_grouped$capacity_abs_diff = abs(in_both_grouped$capacity_diff)
+    
+    # Percentage difference with respect to EIA capacity
+    in_both_grouped$capacity_pct_diff = (in_both_grouped$Rating - in_both_grouped$eia_capacity) / 
+                                         in_both_grouped$eia_capacity * 100
+    in_both_grouped$capacity_abs_pct_diff = abs(in_both_grouped$capacity_pct_diff)
+    in_both_grouped$capacity_ratio = in_both_grouped$Rating / in_both_grouped$eia_capacity
+    
+    
+    
+    # Rename for clarity
+    in_both_grouped = in_both_grouped %>%
       rename(ei_lat = Lat, ei_lon = Lon)
   }
   
-  # Generators in EI but not in EIA
-  in_ei_only = ei_gens_copy %>% filter(is.na(eia_match_idx))
+  # Step 4: Create detailed view (expand to individual generators)
+  in_both_detailed = data.frame()
   
-  # Generators in EIA but not in EI
-  matched_eia_indices = in_both$eia_match_idx[!is.na(in_both$eia_match_idx)]
-  in_eia_only = eia_gens %>% 
+  if (nrow(in_both_grouped) > 0) {
+    for (i in 1:nrow(in_both_grouped)) {
+      row = in_both_grouped[i, ]
+      
+      # Get individual EI generators at this location
+      ei_at_location = ei_gens %>%
+        filter(Lat == row$ei_lat & Lon == row$ei_lon)
+      
+      # Add aggregated matching info to each
+      ei_at_location$eia_plant_names = row$eia_plant_names
+      ei_at_location$eia_generator_ids = row$eia_generator_ids
+      ei_at_location$n_eia_generators = row$n_eia_generators
+      ei_at_location$n_ei_at_location = row$n_ei_generators
+      ei_at_location$eia_capacity = row$eia_capacity
+      ei_at_location$total_ei_capacity_at_location = row$Rating
+      ei_at_location$eia_lat = row$eia_lat
+      ei_at_location$eia_lon = row$eia_lon
+      ei_at_location$capacity_diff = row$capacity_diff
+      ei_at_location$capacity_abs_diff = row$capacity_abs_diff
+      
+      # Rename lat/lon
+      ei_at_location = ei_at_location %>%
+        rename(ei_lat = Lat, ei_lon = Lon)
+      
+      in_both_detailed = bind_rows(in_both_detailed, ei_at_location)
+    }
+  }
+  
+  # Step 5: Identify unmatched generators
+  in_ei_only_grouped = ei_grouped %>% 
+    filter(is.na(eia_match_idx))
+  
+  matched_eia_indices = in_both_grouped$eia_match_idx[!is.na(in_both_grouped$eia_match_idx)]
+  in_eia_only_grouped = eia_grouped %>% 
     filter(!(row_number() %in% matched_eia_indices))
   
   # Calculate summary statistics
   total_ei_capacity = sum(ei_gens$Rating, na.rm = TRUE)
   total_eia_capacity = sum(eia_gens$nameplate_capacity, na.rm = TRUE)
-  matched_ei_capacity = if(nrow(in_both) > 0) sum(in_both$Rating, na.rm = TRUE) else 0
-  matched_eia_capacity = if(nrow(in_both) > 0) sum(in_both$eia_capacity, na.rm = TRUE) else 0
-  mean_capacity_diff = if(nrow(in_both) > 0) mean(in_both$capacity_diff, na.rm = TRUE) else 0
+  matched_ei_capacity = if(nrow(in_both_grouped) > 0) sum(in_both_grouped$Rating, na.rm = TRUE) else 0
+  matched_eia_capacity = if(nrow(in_both_grouped) > 0) sum(in_both_grouped$eia_capacity, na.rm = TRUE) else 0
+  mean_capacity_diff = if(nrow(in_both_grouped) > 0) mean(in_both_grouped$capacity_diff, na.rm = TRUE) else 0
+  mean_capacity_abs_diff = if(nrow(in_both_grouped) > 0) mean(in_both_grouped$capacity_abs_diff, na.rm = TRUE) else 0
   
   # Print summary
   cat("\n", paste(rep("=", 60), collapse = ""), "\n")
   cat("Fleet Comparison Results\n")
   cat(paste(rep("=", 60), collapse = ""), "\n")
-  cat("Generators in both EI and EIA:", nrow(in_both), "\n")
-  cat("Generators in EI only:", nrow(in_ei_only), "\n")
-  cat("Generators in EIA only:", nrow(in_eia_only), "\n")
+  cat("Matched locations:", nrow(in_both_grouped), "\n")
+  if(nrow(in_both_grouped) > 0) {
+    cat("  Total EI generators at matched locations:", sum(in_both_grouped$n_ei_generators), "\n")
+    cat("  Total EIA generators at matched locations:", sum(in_both_grouped$n_eia_generators), "\n")
+  }
+  cat("Unmatched EI locations:", nrow(in_ei_only_grouped), "\n")
+  cat("Unmatched EIA locations:", nrow(in_eia_only_grouped), "\n")
   cat("\nCapacity Summary:\n")
   cat("  Total EI capacity:", round(total_ei_capacity, 2), "MW\n")
   cat("  Total EIA capacity:", round(total_eia_capacity, 2), "MW\n")
   cat("  Matched EI capacity:", round(matched_ei_capacity, 2), "MW\n")
   cat("  Matched EIA capacity:", round(matched_eia_capacity, 2), "MW\n")
   cat("  Mean capacity difference:", round(mean_capacity_diff, 2), "MW\n")
+  cat("  Mean absolute capacity difference:", round(mean_capacity_abs_diff, 2), "MW\n")
   cat(paste(rep("=", 60), collapse = ""), "\n\n")
   
   # Return results as a list
   return(list(
-    in_both = in_both,
-    in_ei_only = in_ei_only,
-    in_eia_only = in_eia_only,
+    in_both_grouped = in_both_grouped,
+    in_both_detailed = in_both_detailed,
+    in_ei_only_grouped = in_ei_only_grouped,
+    in_eia_only_grouped = in_eia_only_grouped,
+    ei_grouped = ei_grouped,
+    eia_grouped = eia_grouped,
     summary = list(
       total_ei_capacity = total_ei_capacity,
       total_eia_capacity = total_eia_capacity,
       matched_ei_capacity = matched_ei_capacity,
       matched_eia_capacity = matched_eia_capacity,
       mean_capacity_diff = mean_capacity_diff,
-      n_matched = nrow(in_both),
-      n_ei_only = nrow(in_ei_only),
-      n_eia_only = nrow(in_eia_only)
+      mean_capacity_abs_diff = mean_capacity_abs_diff,
+      n_matched_locations = nrow(in_both_grouped),
+      n_ei_only_locations = nrow(in_ei_only_grouped),
+      n_eia_only_locations = nrow(in_eia_only_grouped)
     )
   ))
 }
+
+
 ```
+
+# Read all the gens
+
+```{r}
+VA_ei_gens = read_csv("~/Downloads/virginia_resources.csv")
+eia_rd = read_csv("renewable_VA_EIA.csv")
+```
+
+### Exploring the datasets
+
+```{r}
+unique(VA_ei_gens$generator_type)
+unique(eia_rd$technology)
+```
+
+
+```{r}
+#' Compare generator fleets for a specific technology type
+#'
+#' @param ei_gens data.frame: Full EI generators dataframe (virginia_resources.csv)
+#' @param eia_gens data.frame: Full EIA generators dataframe
+#' @param type character: "Solar", "Wind", "Hydro", "Thermal", "Storage"
+#' @param coord_tolerance numeric: tolerance in degrees (default 0.2)
+compare_by_type = function(ei_gens, eia_gens, type = "Solar", coord_tolerance = 0.2) {
+  
+  # ── 1. Type → filter mappings ──────────────────────────────────────────────
+  ei_type_map = list(
+    "Solar"   = c("Solar"),
+    "Wind"    = c("Wind"),
+    "Hydro"   = c("Hydro"),
+    "Thermal" = c("ThermalStandard", "ThermalMultiStart"),
+    "Storage" = c("Storage")
+  )
+  
+  eia_type_map = list(
+    "Solar"   = c("Solar Photovoltaic"),
+    "Wind"    = c("Onshore Wind Turbine", "Offshore Wind Turbine"),
+    "Hydro"   = c("Conventional Hydroelectric", "Run-of-River Hydroelectric"),
+    "Thermal" = c("Natural Gas Steam Turbine", "Natural Gas Fired Combined Cycle",
+                  "Natural Gas Fired Combustion Turbine", "Coal Steam Turbine"),
+    "Storage" = c("Batteries")
+  )
+  
+  if (!type %in% names(ei_type_map)) {
+    stop("Invalid type. Choose from: ", paste(names(ei_type_map), collapse = ", "))
+  }
+  
+  # ── 2. Filter by type ──────────────────────────────────────────────────────
+  ei_filtered = ei_gens %>% filter(generator_type %in% ei_type_map[[type]])
+  eia_filtered = eia_gens %>% filter(technology %in% eia_type_map[[type]])
+  
+  cat("=== Type:", type, "===\n")
+  cat("EI generators:  ", nrow(ei_filtered), "\n")
+  cat("EIA generators: ", nrow(eia_filtered), "\n")
+  
+  if (nrow(ei_filtered) == 0 || nrow(eia_filtered) == 0) {
+    warning("No generators found for type: ", type)
+    return(NULL)
+  }
+  
+  # ── 3. Rename EI columns to match compare_generator_fleets expectations ────
+  ei_renamed = ei_filtered %>%
+    rename(
+      GenName   = name,
+      BusNumber = bus_number,
+      BusName   = bus,
+      Lat       = lat,
+      Lon       = lon,
+      Rating    = rating,
+      Available = available,
+      Type      = generator_type
+      # Rating stays as Rating ✅
+    )
+  
+  # ── 4. Run comparison ──────────────────────────────────────────────────────
+  result = compare_generator_fleets(
+    ei_gens        = ei_renamed,
+    eia_gens       = eia_filtered,
+    coord_tolerance = coord_tolerance
+  )
+  
+  return(result)
+}
+```
+
+### Solar
+
+```{r}
+# Solar comparisons
+solar_results = compare_by_type(VA_ei_gens, eia_rd, type = "Solar", coord_tolerance = 0.2)
+
+# Wind comparison
+#wind_results  = compare_by_type(VA_ei_gens, eia_rd, type = "Wind",  coord_tolerance = 0.2)
+
+# Hydro comparison
+#hydro_results = compare_by_type(VA_ei_gens, eia_rd, type = "Hydro", coord_tolerance = 0.2)
+
+# Access results
+solar_results$in_both_grouped%>%
+  dplyr::select(n_eia_generators, eia_plant_names, n_ei_generators, BusNames,
+                Rating, eia_capacity, 
+                capacity_diff, capacity_abs_diff,
+                capacity_pct_diff, capacity_abs_pct_diff,   
+                ei_lat, eia_lat, ei_lon, eia_lon) %>%
+  dplyr::arrange(desc(capacity_abs_pct_diff))  # sort by % diff    # matched locations
+#solar_results$in_ei_only_grouped  # only in EI
+#solar_results$in_eia_only_grouped # only in EIA
+```
+
+### Wind
+
+```{r}
+# Wind comparison
+wind_results  = compare_by_type(VA_ei_gens, eia_rd, type = "Wind",  coord_tolerance = 0.2)
+
+wind_results$in_both_grouped%>%
+  dplyr::select(n_eia_generators, eia_plant_names, n_ei_generators, BusNames,
+                Rating, eia_capacity, 
+                capacity_diff, capacity_abs_diff,
+                capacity_pct_diff, capacity_abs_pct_diff,   
+                ei_lat, eia_lat, ei_lon, eia_lon) %>%
+  dplyr::arrange(desc(capacity_abs_pct_diff))  # sort by % diff    # matched locations
+
+ei_wind_gens = VA_ei_gens %>% filter(Type == "Wind")
+eia_wind_gens = eia_rd %>% filter(technology == "Offshore Wind Turbine")
+
+
+
+```
+
+```{r}
+# Hydro comparison
+eia_hydro = read_csv("~/Documents/GitHub/va_updates/va_hydro_EIA.csv")
+hydro_results = compare_by_type(VA_ei_gens, eia_hydro, type = "Hydro", coord_tolerance = 0.2)
+
+```
+
+
+
+## Solar
+
+```{r}
+ei_solar_gens = VA_ei_gens %>% filter(Type == "Solar")
+eia_solar_gens = eia_rd %>% filter(technology == "Solar Photovoltaic")
+
+str(ei_solar_gens)
+str(eia_solar_gens)
+```
+
+
+
+```{r}
+
+
+renewable_results = compare_generator_fleets(ei_rd_gens, eia_rd, coord_tolerance = 0.1)
+
+# View grouped results (one row per location)
+renewable_results$in_both_grouped %>%
+  dplyr::select(n_eia_generators, eia_plant_names, n_ei_generators, BusNames,
+                Rating, eia_capacity, 
+                capacity_diff, capacity_abs_diff,
+                capacity_pct_diff, capacity_abs_pct_diff,   
+                ei_lat, eia_lat, ei_lon, eia_lon) %>%
+  dplyr::arrange(desc(capacity_abs_pct_diff))  # sort by % diff 
+  
+
+# View detailed results (one row per EI generator)
+renewable_results$in_both_detailed %>%
+  dplyr::select(GenName, BusNumber, n_ei_at_location, eia_plant_names, n_eia_generators,
+         Rating, eia_capacity, capacity_abs_diff) %>%
+  dplyr::arrange(desc(capacity_abs_diff))
+```
+
+
+```{r}
+library(ggplot2)
+
+ggplot(renewable_results$in_both_grouped,
+       aes(x = eia_capacity, y = Rating)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, color = "red") +
+  scale_x_log10() +
+  scale_y_log10()
+```
+
+
+
+
+### Thermal
+
+```{r}
+
+library(readxl)
+
+thermal_eia = read_excel("Thermal_EIA.xlsx")
+ei_thermal = VA_ei_gens %>%
+  dplyr::filter(Type %in% c("ThermalStandard", "ThermalMultiStart"))
+ei_thermal = ei_thermal %>% filter(!is.na(Lat) & !is.na(Lon))
+thermal_eia = thermal_eia %>% filter(!is.na(lat) & !is.na(lon))
+
+```
+
+
+```{r}
+thermal_results = compare_generator_fleets(
+  ei_thermal,
+  thermal_eia,
+  coord_tolerance = 0.1
+)
+```
+
+```{r}
+# View grouped results (one row per location)
+thermal_results$in_both_grouped %>%
+  dplyr::select(n_eia_generators, eia_plant_names, n_ei_generators, BusNames,
+                Rating, eia_capacity, 
+                capacity_diff, capacity_abs_diff,
+                capacity_pct_diff, capacity_abs_pct_diff,   
+                ei_lat, eia_lat, ei_lon, eia_lon) %>%
+  dplyr::arrange(desc(capacity_abs_pct_diff))  # sort by % diff 
+  
+
+# View detailed results (one row per EI generator)
+thermal_results$in_both_detailed %>%
+  dplyr::select(GenName, BusNumber, n_ei_at_location, eia_plant_names, n_eia_generators,
+         Rating, eia_capacity, capacity_abs_diff) %>%
+  dplyr::arrange(desc(capacity_abs_diff))
+```
+
+
+
+# Hydro
+
+```{r}
+
+library(readxl)
+
+hydro_eia = read_csv("va_hydro_EIA.csv")
+ei_thermal = VA_ei_gens %>%
+  dplyr::filter(Type %in% c("ThermalStandard", "ThermalMultiStart"))
+ei_thermal = ei_thermal %>% filter(!is.na(Lat) & !is.na(Lon))
+thermal_eia = thermal_eia %>% filter(!is.na(lat) & !is.na(lon))
+
+```
+
+
+```{r}
+thermal_results = compare_generator_fleets(
+  ei_thermal,
+  thermal_eia,
+  coord_tolerance = 0.1
+)
+```
+
+
 
 ## Load Data
 
-```{r load-data, results='hide'}
+```{r load-data, message=FALSE, warning=FALSE, include=FALSE, paged.print=FALSE, results='hide'}
 # Load EI generators
 VA_ei_gens = read_csv("VA_original_EI.csv")
 
@@ -192,7 +567,7 @@ summary_df = data.frame(
              "Total EIA capacity (MW)",
              "Matched EI capacity (MW)",
              "Matched EIA capacity (MW)",
-             "Mean capacity difference (MW)"),
+             "Mean capacity absolute difference (MW)"),
   Value = c(
     renewable_results$summary$n_matched,
     renewable_results$summary$n_ei_only,
@@ -201,7 +576,7 @@ summary_df = data.frame(
     round(renewable_results$summary$total_eia_capacity, 2),
     round(renewable_results$summary$matched_ei_capacity, 2),
     round(renewable_results$summary$matched_eia_capacity, 2),
-    round(renewable_results$summary$mean_capacity_diff, 2)
+    round(renewable_results$summary$mean_capacity_abs_diff, 2)
   )
 )
 
@@ -213,24 +588,44 @@ kable(summary_df, caption = "Renewable Generator Fleet Comparison Summary")
 ```{r matched-table}
 if (nrow(renewable_results$in_both) > 0) {
   matched_display = renewable_results$in_both %>%
-    dplyr::select(GenName, Rating, ei_lat, ei_lon, eia_lat, eia_lon, 
-           eia_capacity, capacity_diff, Available) %>%
-    head(20)
+    dplyr::select(BusNumber, GenName, BusName, eia_plant, eia_n_generators,
+                  Rating, eia_capacity, capacity_diff, capacity_abs_diff,
+                  ei_lat, ei_lon, eia_lat, eia_lon, Available) %>%
+    arrange(desc(capacity_abs_diff))
   
   kable(matched_display, 
         caption = "Sample of Matched Generators (first 20)",
         digits = 4)
 }
+
 ```
+
+```{r}
+# Run comparison
+renewable_results = compare_generator_fleets(ei_rd_gens, eia_rd, coord_tolerance = 0.02)
+
+# View grouped results (one row per location)
+renewable_results$in_both_grouped %>%
+  select(ei_lat, ei_lon, n_ei_generators, eia_plant, eia_n_generators, 
+         Rating, eia_capacity, capacity_diff, capacity_abs_diff) %>% arrange(desc(capacity_abs_diff)) 
+
+# View detailed results (one row per EI generator)
+renewable_results$in_both_detailed %>%
+  dplyr::select(GenName, BusNumber, n_ei_at_location, eia_plant, eia_n_generators,
+         Rating, eia_capacity, capacity_diff,capacity_abs_diff, ei_lat, ei_lon) %>%
+  dplyr::arrange(desc(capacity_abs_diff))
+```
+
+
 
 ### Capacity Difference Distribution
 
 ```{r capacity-plot, fig.width=10, fig.height=6}
 if (nrow(renewable_results$in_both) > 0) {
-  ggplot(renewable_results$in_both, aes(x = capacity_diff)) +
+  ggplot(renewable_results$in_both, aes(x = capacity_abs_diff)) +
     geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
     geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
-    labs(title = "Distribution of Capacity Differences (EI - EIA)",
+    labs(title = "Distribution of Capacity Absolute Differences (EI - EIA)",
          x = "Capacity Difference (MW)",
          y = "Count") +
     theme_minimal()
@@ -317,4 +712,4 @@ This comparison identified:
 - **`r renewable_results$summary$n_ei_only`** generators only in EI (may be unavailable)
 - **`r renewable_results$summary$n_eia_only`** generators only in EIA (not in the system model)
 
-The mean capacity difference for matched generators is **`r round(renewable_results$summary$mean_capacity_diff, 2)` MW**.
+The Mean capacity absolute difference for matched generators is **`r round(renewable_results$summary$mean_capacity_abs_diff, 2)` MW**.
